@@ -1,0 +1,22 @@
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+
+# Secrets and credentials
+.env
+.env.*
+*.env
+*.pem
+*KEY*.txt
+*API*.txt
+
+# Dependencies and bytecode
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+*.log
