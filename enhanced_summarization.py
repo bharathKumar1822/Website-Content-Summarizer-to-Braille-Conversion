@@ -6,15 +6,11 @@ This module provides improved summarization capabilities for the URL to Braille 
 import os
 import traceback
 import re
-import nltk
 import gc
 from newspaper import Article
-from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import openai
 import pickle
 import sys
-import torch
 import sentencepiece as spm
 from functools import lru_cache
 import logging
@@ -27,6 +23,9 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('enhanced_summarization')
 
+# In-memory model cache for reuse across requests
+_MODEL_CACHE = {}
+
 # Memory optimization for deployment environments
 def optimize_memory_usage():
     """Apply memory optimization settings for deployment environments"""
@@ -36,6 +35,7 @@ def optimize_memory_usage():
         # Force CPU usage to reduce memory consumption
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
         # Reduce model precision
+        import torch
         torch.set_default_dtype(torch.float32)
         # Garbage collect to free memory
         gc.collect()
@@ -58,34 +58,22 @@ os.environ['HF_HOME'] = CACHE_DIR
 os.environ['HF_DATASETS_CACHE'] = os.path.join(CACHE_DIR, 'datasets')
 os.environ['HUGGINGFACE_HUB_CACHE'] = os.path.join(CACHE_DIR, 'hub')
 
-# Load API keys from environment files
-load_dotenv('openAi.env')
+# Load API keys from environment variables only.
+# On Render, these are injected as env-vars.  Locally, dotenv loads them from *.env files.
+load_dotenv('openAi.env')   # no-op when file absent (Render)
+load_dotenv('gemini.env')   # no-op when file absent (Render)
 API_KEY = os.environ.get('OPENAI_API_KEY')
-
-# Load Gemini API key from environment file
-load_dotenv('gemini.env')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
-if not GEMINI_API_KEY:
-    logger.warning("Gemini API key not found in environment file. Create a file named 'gemini.env' with your API key in the format: GEMINI_API_KEY=your_api_key_here")
-
-if not API_KEY:
-    logger.warning("OpenAI API key not found in environment file, trying to load from file directly")
-    try:
-        with open('openAi.env', 'r') as f:
-            content = f.read().strip()
-            if content.startswith('OPENAI_API_KEY='):
-                API_KEY = content.split('=', 1)[1].strip()
-                logger.info(f"Found OpenAI API key: {API_KEY[:10]}...")
-    except Exception as e:
-        logger.error(f"Error reading OpenAI API key from file: {e}")
-
-# Ensure the OpenAI API key is set in environment
 if API_KEY:
-    os.environ['OPENAI_API_KEY'] = API_KEY
-    logger.info(f"Successfully loaded OpenAI API key: {API_KEY[:10]}...")
+    logger.info(f"OpenAI API key loaded: {API_KEY[:10]}...")
 else:
-    logger.warning("Failed to load OpenAI API key")
+    logger.warning("OPENAI_API_KEY not set — OpenAI summarization will be unavailable")
+
+if GEMINI_API_KEY:
+    logger.info(f"Gemini API key loaded: {GEMINI_API_KEY[:10]}...")
+else:
+    logger.warning("GEMINI_API_KEY not set — Gemini summarization will be unavailable")
 
 def extract_content_with_newspaper(url):
     """
@@ -208,11 +196,14 @@ def summarize_with_gemini(text, min_length=150, max_length=300):
             logger.error(f"Unexpected response structure from Gemini API: {response_data}")
             return None
         else:
-            # If Gemini Pro 1.5 fails, try with Gemini Pro as fallback
-            if response.status_code == 400 and "gemini-2.0-flash" in response.text:
-                logger.warning("Gemini Pro 1.5 not available, falling back to Gemini Pro")
+            # Handle quota exceeded (429) - return None to trigger fallback immediately
+            if response.status_code == 429:
+                logger.warning("Gemini API quota exceeded (429), switching to fallback summarizer")
+                return None
+            # If model not found (400), try with Gemini Flash as fallback
+            if response.status_code == 400:
+                logger.warning("Gemini model not available (400), falling back to gemini-pro")
                 return summarize_with_gemini_pro(text, min_length, max_length)
-            
             logger.error(f"Gemini API request failed with status code {response.status_code}: {response.text}")
             return None
         
@@ -325,10 +316,19 @@ def summarize_with_gpt2(text, max_length=300):
             return None
             
         logger.info("Attempting to summarize with GPT-2")
+
+        import torch
+        from transformers import GPT2LMHeadModel, GPT2Tokenizer
         
         # Load model and tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        model = GPT2LMHeadModel.from_pretrained('gpt2')
+        # Temporarily allow network access for model download if not already cached
+        _orig_offline = os.environ.pop('TRANSFORMERS_OFFLINE', None)
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained('gpt2', cache_dir=CACHE_DIR)
+        finally:
+            if _orig_offline is not None:
+                os.environ['TRANSFORMERS_OFFLINE'] = _orig_offline
+            model = GPT2LMHeadModel.from_pretrained('gpt2', cache_dir=CACHE_DIR)
         
         # Set special tokens
         tokenizer.pad_token = tokenizer.eos_token
@@ -370,46 +370,70 @@ def summarize_with_gpt(text, max_tokens=800):
     """
     Summarize text using OpenAI's GPT-3.5-turbo model with a direct approach.
     Updated to generate longer summaries (12-15 lines).
+    Compatible with both openai v0.x (legacy/0.28.x) and v1.x (new) APIs.
     """
     try:
         # Get API key from environment
         api_key = os.environ.get('OPENAI_API_KEY')
-        
+
         if not api_key:
             logger.warning("No OpenAI API key found in environment")
             return None
-        
+
         logger.info(f"Using API key: {api_key[:10]}...")
-        
-        # Import OpenAI client
-        from openai import OpenAI
-        
-        # Create client with the API key
-        client = OpenAI(api_key=api_key)
-        logger.info("OpenAI client created successfully")
-        
-        # Send request to OpenAI API with instructions for longer summary
-        logger.info("Sending request to OpenAI API...")
-        response = client.chat.completions.create(
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that summarizes text accurately and comprehensively."
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Summarize the following text in a detailed manner, providing a comprehensive "
+                    "summary of 12-15 lines that captures all important information and key points:"
+                    f"\n\n{text}"
+                )
+            }
+        ]
+
+        # Try new openai v1.x API first (OpenAI class)
+        try:
+            from openai import OpenAI as _OpenAI
+            client = _OpenAI(api_key=api_key)
+            logger.info("Using OpenAI v1.x client")
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=max_tokens
+            )
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"OpenAI summary length: {len(summary)} characters")
+            return summary
+        except (ImportError, AttributeError):
+            pass  # Fall through to legacy v0.x API
+
+        # Fall back to old openai v0.x API (openai==0.28.x)
+        import openai as _openai
+        logger.info("Using OpenAI v0.x API (legacy)")
+        _openai.api_key = api_key
+        response = _openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes text accurately and comprehensively."},
-                {"role": "user", "content": f"Summarize the following text in a detailed manner, providing a comprehensive summary of 12-15 lines that captures all important information and key points:\n\n{text}"}
-            ],
-            temperature=0.7,  # Slightly higher temperature for more detailed output
+            messages=messages,
+            temperature=0.7,
             max_tokens=max_tokens
         )
-        
-        # Extract and return the summary
-        summary = response.choices[0].message.content.strip()
+        summary = response.choices[0].message['content'].strip()
         logger.info(f"OpenAI summary length: {len(summary)} characters")
-        logger.info(f"Tokens used: {response.usage.total_tokens}")
         return summary
-        
+
     except Exception as e:
         logger.error(f"Error in OpenAI summarization: {e}")
+        import traceback
         traceback.print_exc()
         return None
+
 
 def get_model_and_tokenizer(model_name, tokenizer_class, model_class, use_auth_token=None):
     """

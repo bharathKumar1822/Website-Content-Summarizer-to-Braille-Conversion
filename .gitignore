@@ -1,22 +1,45 @@
-# Elastic Beanstalk Files
-.elasticbeanstalk/*
-!.elasticbeanstalk/*.cfg.yml
-!.elasticbeanstalk/*.global.yml
-
-# Secrets and credentials
-.env
-.env.*
+# ── Secrets & credentials ──────────────────────────────────────────────────
 *.env
 *.pem
 *KEY*.txt
 *API*.txt
+*key*.txt
+*.ppn
 
-# Dependencies and bytecode
-node_modules/
-.venv/
-venv/
+# ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# Runtime logs
+# ── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── ML model cache (large binary files) ────────────────────────────────────
+model_cache/
+
+# ── Logs & temp ─────────────────────────────────────────────────────────────
 *.log
+error.log
+*.tmp
+*.zip
+*.tar
+*.tar.gz
+
+# ── IDE / OS ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.user
+
+# ── AWS Elastic Beanstalk (not used on Render) ──────────────────────────────
+.elasticbeanstalk/

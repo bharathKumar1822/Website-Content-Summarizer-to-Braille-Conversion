@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
 import requests
 import traceback
 import base64
@@ -11,13 +13,6 @@ import gc
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from bs4 import BeautifulSoup
-from sumy.parsers.html import HtmlParser
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lsa import LsaSummarizer
-from sumy.nlp.stemmers import Stemmer
-from sumy.utils import get_stop_words
-import nltk
 import re
 from dotenv import load_dotenv
 import redis
@@ -28,7 +23,6 @@ import hashlib
 import pickle
 import concurrent.futures
 from newspaper import Article
-from transformers import pipeline, BartTokenizer, BartForConditionalGeneration
 import openai
 import threading
 import datetime
@@ -42,53 +36,36 @@ logger = logging.getLogger(__name__)
 
 # Memory optimization settings for deployment
 # These settings help reduce memory usage on platforms like Render
+# Note: TRANSFORMERS_OFFLINE=1 prevents HuggingFace downloads at runtime.
+# GPT-2 in enhanced_summarization.py bypasses this for initial model download.
 os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Avoid downloading models during runtime
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable parallelism in tokenizers
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Reduce TensorFlow logging
 
-# Load OpenAI API key from environment file
-print("Loading OpenAI API key from openAi.env file...")
-load_dotenv('openAi.env')
+# -----------------------------------------------------------------------
+# API KEY LOADING — env-var first (Render injected), .env file for local dev
+# Never read keys directly from files; dotenv is the safe bridge locally.
+# -----------------------------------------------------------------------
+load_dotenv('openAi.env')   # no-op when file is absent (Render)
+load_dotenv('gemini.env')   # no-op when file is absent (Render)
+load_dotenv('REDIS_URL.env')  # no-op when file is absent (Render)
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 
-if not OPENAI_API_KEY:
-    print("API key not found in environment after loading .env file, trying to read directly")
-    try:
-        with open('openAi.env', 'r') as f:
-            content = f.read().strip()
-            if content.startswith('OPENAI_API_KEY='):
-                OPENAI_API_KEY = content.split('=', 1)[1]
-                print(f"Found OpenAI API key in file: {OPENAI_API_KEY[:10]}...")
-    except Exception as e:
-        print(f"Error reading OpenAI API key from file: {e}")
-
-# Set the OpenAI API key
 if OPENAI_API_KEY:
-    os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
     openai.api_key = OPENAI_API_KEY
-    print(f"OpenAI API key set successfully: {OPENAI_API_KEY[:10]}...")
+    print(f"OpenAI API key loaded: {OPENAI_API_KEY[:10]}...")
 else:
-    print("WARNING: OpenAI API key not found, LLM-based summarization will not be available")
+    print("WARNING: OPENAI_API_KEY not set — OpenAI summarization will be unavailable")
 
 # Import the enhanced summarization module
 from enhanced_summarization import extract_content_with_newspaper, summarize_with_gpt, integrated_summarize
-# Import key functions for fallback
-from key_functions import summarize_text, extract_key_sentences
-
-# Download necessary NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all domains
-load_dotenv()
 
 # Redis configuration
-# Redis is optional. Prefer REDIS_URL, then REDIS_HOST/PORT/PASSWORD settings.
-load_dotenv('REDIS_URL.env')
+# Prefer REDIS_URL env-var (supports both redis:// and rediss:// for TLS).
+# Fall back to individual REDIS_HOST / REDIS_PORT / REDIS_PASSWORD vars.
 redis_url = os.environ.get('REDIS_URL')
 redis_host = os.environ.get('REDIS_HOST', '127.0.0.1')
 redis_port = int(os.environ.get('REDIS_PORT', '6379'))
@@ -99,8 +76,24 @@ redis_client = None
 last_cache_clear_time = None
 
 try:
-    if redis_url and not redis_url.startswith('******'):
-        redis_client = redis.from_url(redis_url, decode_responses=False)
+    if redis_url:
+        # rediss:// means TLS; redis-py handles it automatically via from_url.
+        # ssl_cert_reqs=None allows self-signed certs (common on Redis Cloud free tier).
+        if redis_url.startswith('rediss://'):
+            redis_client = redis.from_url(
+                redis_url,
+                decode_responses=False,
+                ssl_cert_reqs=None,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
+        else:
+            redis_client = redis.from_url(
+                redis_url,
+                decode_responses=False,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
     else:
         redis_client = redis.Redis(
             host=redis_host,
@@ -108,18 +101,16 @@ try:
             username=redis_username,
             password=redis_password,
             decode_responses=False,
-            socket_connect_timeout=2,
-            socket_timeout=2
+            socket_connect_timeout=5,
+            socket_timeout=5,
         )
     redis_client.ping()  # Test the connection
     REDIS_AVAILABLE = True
-    print("Redis Cloud connected successfully")
-    
-    # Set the initial cache clear time
+    print(f"Redis Cloud connected successfully (url scheme: {(redis_url or 'host').split(':')[0]})")
     last_cache_clear_time = datetime.datetime.now()
     print(f"Initial cache clear time set to: {last_cache_clear_time}")
 except Exception as e:
-    print(f"Redis Cloud connection failed: {e}")
+    print(f"Redis connection failed: {e}")
     REDIS_AVAILABLE = False
 
 def generate_cache_key(prefix, data):
@@ -137,13 +128,40 @@ def generate_cache_key(prefix, data):
 
 def check_redis_connection():
     """Check if Redis connection is working and return status."""
-    if not REDIS_AVAILABLE:
+    global REDIS_AVAILABLE
+    if not redis_client:
         return False
-    
+
     try:
         redis_client.ping()
+        REDIS_AVAILABLE = True
         return True
     except Exception:
+        # Mark as unavailable; will retry on next request
+        REDIS_AVAILABLE = False
+        return False
+
+
+def safe_redis_get(key):
+    """Safe Redis GET that handles connection drops gracefully."""
+    if not check_redis_connection():
+        return None
+    try:
+        return redis_client.get(key)
+    except Exception as e:
+        logger.warning(f"Redis GET failed: {e}")
+        return None
+
+
+def safe_redis_setex(key, ttl, value):
+    """Safe Redis SETEX that handles connection drops gracefully."""
+    if not check_redis_connection():
+        return False
+    try:
+        redis_client.setex(key, ttl, value)
+        return True
+    except Exception as e:
+        logger.warning(f"Redis SETEX failed: {e}")
         return False
 
 def clear_all_cache():
@@ -268,6 +286,15 @@ def clear_cache():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/health')
+def health():
+    """Health-check endpoint used by Render to verify the service is alive."""
+    redis_ok = check_redis_connection() if redis_client else False
+    return jsonify({
+        'status': 'ok',
+        'redis': 'connected' if redis_ok else 'disconnected',
+    })
 
 def spell_check_text(text):
     """
@@ -655,21 +682,27 @@ def process_url():
             logger.debug(f"Checking cache with key: {cache_key}")
             
             try:
-                cached_result = redis_client.get(cache_key)
-                if cached_result:
+                cached_bytes = safe_redis_get(cache_key)
+                if cached_bytes:
                     logger.info(f"Cache hit for URL: {url}, language: {target_language}")
-                    
+                    # Deserialize ONCE to avoid creating multiple separate objects
+                    cached_result = pickle.loads(cached_bytes)
+
                     # Always regenerate audio data even for cached results
                     # This ensures fresh audio for each request
                     if target_language in ['en', 'hi', 'kn']:
-                        text_for_audio = pickle.loads(cached_result).get('translated_summary') if target_language != 'en' and pickle.loads(cached_result).get('translated_summary') else pickle.loads(cached_result).get('summary')
+                        text_for_audio = (
+                            cached_result.get('translated_summary')
+                            if target_language != 'en' and cached_result.get('translated_summary')
+                            else cached_result.get('summary')
+                        )
                         if text_for_audio:
-                            pickle.loads(cached_result)['audio'] = generate_audio_google_tts(text_for_audio, target_language)
-                    
-                    # Add cache hit indicator and processing time 
-                    pickle.loads(cached_result)['cache_hit'] = True
-                    pickle.loads(cached_result)['processing_time'] = 0  # No processing time for cache hits
-                    return jsonify(pickle.loads(cached_result))
+                            cached_result['audio'] = generate_audio_google_tts(text_for_audio, target_language)
+
+                    # Add cache hit indicator and processing time
+                    cached_result['cache_hit'] = True
+                    cached_result['processing_time'] = 0  # No processing time for cache hits
+                    return jsonify(cached_result)
             except Exception as cache_error:
                 logger.error(f"Error retrieving from cache: {str(cache_error)}", exc_info=True)
                 # Continue with normal processing if cache retrieval fails
@@ -686,22 +719,23 @@ def process_url():
                 # Fallback to our custom extraction method
                 response = requests.get(url, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }, verify=False)
+                }, verify=False, timeout=20)
                 response.raise_for_status()
-                
+
                 # Parse HTML content
                 soup = BeautifulSoup(response.text, 'html.parser')
                 article_content = extract_main_content(soup)
                 title = soup.title.string if soup.title else "No title found"
             else:
                 # If using newspaper3k, we need to get the title separately
+                title = "No title found"  # Default in case fetch fails
                 try:
                     response = requests.get(url, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    }, verify=False)
+                    }, verify=False, timeout=10)
                     soup = BeautifulSoup(response.text, 'html.parser')
                     title = soup.title.string if soup.title else "No title found"
-                except:
+                except Exception:
                     title = "No title found"
             
             logger.debug(f"Content extraction successful, content length: {len(article_content)}")
@@ -804,7 +838,7 @@ def process_url():
                     }
                     
                     # Use a 24-hour cache expiration
-                    redis_client.setex(
+                    safe_redis_setex(
                         cache_key,
                         86400,  # 24 hours in seconds
                         pickle.dumps(cache_result)
@@ -830,9 +864,9 @@ def translate_text(text, target_language):
     """Translate text using a free translation API with caching."""
     try:
         # Check cache first
-        if REDIS_AVAILABLE:
+        if check_redis_connection():
             cache_key = generate_cache_key('translate', {'text': text, 'lang': target_language})
-            cached_result = redis_client.get(cache_key)
+            cached_result = safe_redis_get(cache_key)
             if cached_result:
                 logger.info(f"Using cached translation for language: {target_language}")
                 return pickle.loads(cached_result)
@@ -862,9 +896,9 @@ def translate_text(text, target_language):
                 translated_text += sentence[0]
         
         # Cache the result
-        if REDIS_AVAILABLE and translated_text:
+        if translated_text:
             # Cache translations for 7 days (604800 seconds)
-            redis_client.setex(cache_key, 604800, pickle.dumps(translated_text))
+            safe_redis_setex(cache_key, 604800, pickle.dumps(translated_text))
             logger.info(f"Cached translation for language: {target_language}")
         
         return translated_text
@@ -915,6 +949,7 @@ def post_process_summary(text):
     - Fix capitalization
     """
     try:
+        import nltk
         # Fix spacing issues
         text = re.sub(r'\s+', ' ', text)
         text = re.sub(r'\s([.,;:!?])', r'\1', text)
@@ -965,6 +1000,7 @@ def ensure_coherence(text):
     3. Removing sentences that seem disconnected
     """
     try:
+        import nltk
         sentences = nltk.sent_tokenize(text)
         if len(sentences) <= 1:
             return text
@@ -1001,9 +1037,9 @@ def generate_audio_google_tts(text, language='en'):
     """Generate audio using Google Translate TTS API with caching."""
     try:
         # Check cache first
-        if REDIS_AVAILABLE:
+        if check_redis_connection():
             cache_key = generate_cache_key('audio', {'text': text, 'lang': language})
-            cached_result = redis_client.get(cache_key)
+            cached_result = safe_redis_get(cache_key)
             if cached_result:
                 logger.info(f"Using cached audio for language: {language}")
                 return pickle.loads(cached_result)
@@ -1251,9 +1287,9 @@ def generate_audio_google_tts(text, language='en'):
             logger.warning(f"Warning: Failed to delete temporary file {temp_file_path}: {e}")
         
         # Cache the audio data
-        if REDIS_AVAILABLE and audio_data:
+        if audio_data:
             # Cache audio for 7 days (604800 seconds)
-            redis_client.setex(cache_key, 604800, pickle.dumps(audio_data))
+            safe_redis_setex(cache_key, 604800, pickle.dumps(audio_data))
             logger.info(f"Cached audio for language: {language}")
         
         return audio_data
@@ -2014,6 +2050,11 @@ def correct_voice_command():
     corrected_command = original_command
     correction_method = 'none'
     correction_confidence = confidence
+    # Pre-compute cache key so it's available throughout the function
+    cache_key = generate_cache_key('command_correction', {
+        'command': original_command,
+        'confidence': confidence
+    })
     
     # Define known command patterns for fuzzy matching
     known_commands = {
@@ -2157,17 +2198,11 @@ def correct_voice_command():
     # Try GPT-4 correction if API key is available
     if OPENAI_API_KEY:
         try:
-            # Cache key for this correction request
-            cache_key = generate_cache_key('command_correction', {
-                'command': original_command,
-                'confidence': confidence
-            })
-            
-            # Check cache first
-            if REDIS_AVAILABLE:
-                cached_result = redis_client.get(cache_key)
-                if cached_result:
-                    return pickle.loads(cached_result)
+            # Check cache first (cache_key already defined above)
+            if check_redis_connection():
+                cached_bytes = safe_redis_get(cache_key)
+                if cached_bytes:
+                    return jsonify(pickle.loads(cached_bytes))
             
             # Prepare the prompt for GPT-4 with improved context for scientific terms
             system_prompt = """You are an AI assistant that corrects misheard voice commands. 
@@ -2190,19 +2225,33 @@ def correct_voice_command():
             
             user_prompt = f"Correct this potentially misheard voice command: '{original_command}'"
             
-            # Call OpenAI API
-            response = openai.ChatCompletion.create(
-                model="gpt-4",  # Use GPT-4 for best accuracy
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=50,
-                temperature=0.3  # Low temperature for more predictable outputs
-            )
-            
-            # Extract the corrected command from the response
-            gpt_corrected_command = response.choices[0].message.content.strip()
+            # Call OpenAI API (using gpt-3.5-turbo for broader availability)
+            # Try new v1.x API first
+            try:
+                from openai import OpenAI as _OpenAI
+                _client = _OpenAI(api_key=OPENAI_API_KEY)
+                _resp = _client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=50,
+                    temperature=0.3
+                )
+                gpt_corrected_command = _resp.choices[0].message.content.strip()
+            except (ImportError, AttributeError):
+                # Fall back to openai v0.28.x API
+                _resp = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=50,
+                    temperature=0.3
+                )
+                gpt_corrected_command = _resp.choices[0].message['content'].strip()
             
             # Only use GPT's correction if it's different from the original
             if gpt_corrected_command != original_command:
@@ -2300,19 +2349,17 @@ def correct_voice_command():
     }
     
     # Cache the result
-    if REDIS_AVAILABLE:
-        try:
-            redis_client.setex(
-                cache_key,
-                60 * 60,  # Cache for 1 hour
-                pickle.dumps(result)
-            )
-        except Exception as e:
-            logger.error(f"Error caching command correction: {e}")
+    safe_redis_setex(cache_key, 60 * 60, pickle.dumps(result))  # Cache for 1 hour
     
     return jsonify(result)
     
-if __name__ == '__main__':
-    # Start the cache maintenance thread before running the app
+# Start cache maintenance when the module is first imported (gunicorn pre-fork).
+# Wrapped in a try/except so import errors never crash startup.
+try:
     start_cache_maintenance()
-    app.run(host="0.0.0.0",port=5000,debug=True)
+except Exception as _startup_err:
+    print(f"Cache maintenance startup error (non-fatal): {_startup_err}")
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

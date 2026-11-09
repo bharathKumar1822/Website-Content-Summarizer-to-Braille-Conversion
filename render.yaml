@@ -2,19 +2,30 @@ services:
   - type: web
     name: braille-converter
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --timeout 120 --workers 1 --threads 2
-    envVars:
-      - key: RENDER
-        value: true
-      - key: LOW_MEMORY
-        value: true
-      - key: PYTHON_VERSION
-        value: 3.9.0
-      - key: TRANSFORMERS_OFFLINE
-        value: 1
-      - key: TOKENIZERS_PARALLELISM
-        value: false
-      - key: TF_CPP_MIN_LOG_LEVEL
-        value: 3
     plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && python -m nltk.downloader punkt punkt_tab averaged_perceptron_tagger stopwords
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 4 --preload
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: RENDER
+        value: "true"
+      - key: LOW_MEMORY
+        value: "true"
+      - key: TRANSFORMERS_OFFLINE
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      - key: TF_CPP_MIN_LOG_LEVEL
+        value: "3"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      # ── Secrets — set via Render dashboard, not here ──
+      # REDIS_URL        → rediss://<user>:<pass>@<host>:<port>  (or redis://)
+      # OPENAI_API_KEY   → sk-...
+      # GEMINI_API_KEY   → AIza...
+      # GOOGLE_API_KEY   → AIza...  (for Google Custom Search)
+      # GOOGLE_CSE_ID    → <your CSE ID>
