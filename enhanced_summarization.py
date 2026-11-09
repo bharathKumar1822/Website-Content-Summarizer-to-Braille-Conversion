@@ -28,18 +28,21 @@ _MODEL_CACHE = {}
 
 # Memory optimization for deployment environments
 def optimize_memory_usage():
-    """Apply memory optimization settings for deployment environments"""
-    # Set PyTorch to use CPU if memory is constrained
+    """Apply memory optimization settings for deployment environments.
+    torch is optional — when not installed (e.g. on Render free tier) the
+    GPU-cleanup steps are skipped but the memory-optimized flag is still set.
+    """
     if os.environ.get('RENDER') == 'true' or os.environ.get('LOW_MEMORY') == 'true':
         logger.info("Running in memory-constrained environment, applying optimizations")
-        # Force CPU usage to reduce memory consumption
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
-        # Reduce model precision
-        import torch
-        torch.set_default_dtype(torch.float32)
-        # Garbage collect to free memory
         gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        try:
+            import torch
+            torch.set_default_dtype(torch.float32)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            logger.info("torch not installed — skipping GPU cleanup (expected on Render)")
         return True
     return False
 
