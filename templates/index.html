@@ -3017,11 +3017,24 @@
               }),
             });
 
-            // Check if we got JSON or HTML
-            const contentType = response.headers.get("content-type");
-            if (contentType && contentType.indexOf("application/json") !== -1) {
-              if (response.ok) {
-                const data = await response.json();
+            // Read the body once. Gate on JSON content, not the header:
+            // a crashed or misrouted server returns an HTML error page
+            // (often with a text/html content type) for /process.
+            const rawBody = await response.text();
+            let data;
+            try {
+              data = JSON.parse(rawBody);
+            } catch (parseError) {
+              throw new Error(
+                "Server error (" +
+                  response.status +
+                  "): /process returned a web page instead of JSON. Start the app with python app.py and open http://127.0.0.1:5000/."
+              );
+            }
+            if (!response.ok) {
+              throw new Error(data.error || "Failed to process URL");
+            }
+            if (data) {
 
                 // Hide loading spinner
                 document.getElementById("loading-spinner").style.display =
@@ -3080,15 +3093,6 @@
                     startListening();
                   }
                 }, 1000);
-              } else {
-                const errorData = await response.json();
-                throw new Error(errorData.error || "Failed to process URL");
-              }
-            } else {
-              // We received HTML instead of JSON - likely a server error
-              throw new Error(
-                "Server error: Received HTML instead of JSON. The API endpoint might be incorrect."
-              );
             }
           } catch (error) {
             console.error("Error:", error);

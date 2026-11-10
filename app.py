@@ -11,6 +11,7 @@ import urllib3
 import logging
 import gc
 from flask import Flask, render_template, request, jsonify
+from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 import re
@@ -62,6 +63,50 @@ from enhanced_summarization import extract_content_with_newspaper, summarize_wit
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all domains
+# Avoid POST /process/ -> 308 redirect -> GET, which returns an HTML 405 page.
+app.url_map.strict_slashes = False
+
+_JSON_API_PREFIXES = (
+    '/process',
+    '/search',
+    '/generate-audio',
+    '/correct-voice-command',
+    '/health',
+    '/cache-status',
+    '/clear-cache',
+)
+
+def _request_wants_json():
+    path = request.path or ''
+    if path.startswith(_JSON_API_PREFIXES):
+        return True
+    best = request.accept_mimetypes.best
+    return best == 'application/json'
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(error):
+    """API routes must never answer with an HTML error page."""
+    if _request_wants_json():
+        return jsonify({
+            'error': error.description or error.name,
+            'status': error.code,
+        }), error.code
+    return error.get_response()
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(error):
+    if isinstance(error, HTTPException):
+        return handle_http_exception(error)
+    logger.error("Unhandled exception: %s", error, exc_info=True)
+    if _request_wants_json():
+        return jsonify({
+            'error': 'Internal server error',
+            'details': str(error),
+        }), 500
+    return jsonify({
+        'error': 'Internal server error',
+        'details': str(error),
+    }), 500
 
 # Redis configuration
 # Prefer REDIS_URL env-var (supports both redis:// and rediss:// for TLS).
@@ -383,7 +428,7 @@ def spell_check_text(text):
 
 @app.route('/search', methods=['POST'])
 def search_topic():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     topic = data.get('topic')
     logger.debug(f"Search request received for topic: {topic}")
     
@@ -661,7 +706,7 @@ def process_url():
     """Process a URL to extract, summarize, and convert content to braille."""
     try:
         start_time = time.time()
-        data = request.json
+        data = request.get_json(silent=True) or {}
         url = data.get('url')
         target_language = data.get('language', 'en')
         
@@ -860,9 +905,28 @@ def process_url():
         traceback.print_exc()
         return jsonify({'error': 'Failed to process URL request', 'details': str(e)}), 500
 
+@app.route('/generate-audio', methods=['POST'])
+def generate_audio():
+    """Generate speech audio for text already shown in the UI."""
+    try:
+        data = request.get_json(silent=True) or {}
+        text = (data.get('text') or '').strip()
+        language = data.get('language', 'en')
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        audio_data = generate_audio_google_tts(text, language)
+        if not audio_data:
+            return jsonify({'error': 'Failed to generate audio'}), 500
+        return jsonify({'audio': audio_data})
+    except Exception as e:
+        logger.error(f"Error in generate_audio: {e}")
+        traceback.print_exc()
+        return jsonify({'error': 'Failed to generate audio', 'details': str(e)}), 500
+
 def translate_text(text, target_language):
     """Translate text using a free translation API with caching."""
     try:
+        cache_key = None
         # Check cache first
         if check_redis_connection():
             cache_key = generate_cache_key('translate', {'text': text, 'lang': target_language})
@@ -883,8 +947,11 @@ def translate_text(text, target_language):
         }
         
         # Make the request
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=20)
         response.raise_for_status()
+        if "json" not in (response.headers.get("content-type") or "").lower():
+            logger.error("Translation API returned non-JSON content")
+            return None
         
         # Parse the response
         result = response.json()
@@ -896,7 +963,7 @@ def translate_text(text, target_language):
                 translated_text += sentence[0]
         
         # Cache the result
-        if translated_text:
+        if translated_text and cache_key:
             # Cache translations for 7 days (604800 seconds)
             safe_redis_setex(cache_key, 604800, pickle.dumps(translated_text))
             logger.info(f"Cached translation for language: {target_language}")
@@ -1036,6 +1103,7 @@ def ensure_coherence(text):
 def generate_audio_google_tts(text, language='en'):
     """Generate audio using Google Translate TTS API with caching."""
     try:
+        cache_key = None
         # Check cache first
         if check_redis_connection():
             cache_key = generate_cache_key('audio', {'text': text, 'lang': language})
@@ -1287,7 +1355,7 @@ def generate_audio_google_tts(text, language='en'):
             logger.warning(f"Warning: Failed to delete temporary file {temp_file_path}: {e}")
         
         # Cache the audio data
-        if audio_data:
+        if audio_data and cache_key:
             # Cache audio for 7 days (604800 seconds)
             safe_redis_setex(cache_key, 604800, pickle.dumps(audio_data))
             logger.info(f"Cached audio for language: {language}")

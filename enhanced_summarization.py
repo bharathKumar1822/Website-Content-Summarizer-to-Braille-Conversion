@@ -73,10 +73,23 @@ if API_KEY:
 else:
     logger.warning("OPENAI_API_KEY not set — OpenAI summarization will be unavailable")
 
-if GEMINI_API_KEY:
+def _is_configured_key(value):
+    """Return False for missing keys and obvious placeholders."""
+    if not value or not str(value).strip():
+        return False
+    lower = str(value).strip().lower()
+    return not (
+        lower.startswith("your_")
+        or "placeholder" in lower
+        or lower in {"changeme", "api_key", "none", "null"}
+    )
+
+if not _is_configured_key(GEMINI_API_KEY):
+    if GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY is a placeholder — Gemini summarization will be unavailable")
+    GEMINI_API_KEY = None
+elif GEMINI_API_KEY:
     logger.info(f"Gemini API key loaded: {GEMINI_API_KEY[:10]}...")
-else:
-    logger.warning("GEMINI_API_KEY not set — Gemini summarization will be unavailable")
 
 def extract_content_with_newspaper(url):
     """
@@ -86,6 +99,7 @@ def extract_content_with_newspaper(url):
     try:
         logger.info(f"Extracting content with newspaper3k from {url}")
         article = Article(url)
+        article.config.request_timeout = 12
         article.download()
         article.parse()
         
@@ -179,9 +193,18 @@ def summarize_with_gemini(text, min_length=150, max_length=300):
         response = requests.post(
             f"{api_url}?key={GEMINI_API_KEY}",
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=20,
         )
         
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "json" not in content_type:
+            logger.error(
+                "Gemini API returned non-JSON content (status %s)",
+                response.status_code,
+            )
+            return None
+
         # Check if the request was successful
         if response.status_code == 200:
             response_data = response.json()
@@ -205,6 +228,10 @@ def summarize_with_gemini(text, min_length=150, max_length=300):
                 return None
             # If model not found (400), try with Gemini Flash as fallback
             if response.status_code == 400:
+                body = response.text or ""
+                if "API_KEY_INVALID" in body or "API key not valid" in body:
+                    logger.error("Gemini API key is invalid")
+                    return None
                 logger.warning("Gemini model not available (400), falling back to gemini-pro")
                 return summarize_with_gemini_pro(text, min_length, max_length)
             logger.error(f"Gemini API request failed with status code {response.status_code}: {response.text}")
@@ -278,9 +305,18 @@ def summarize_with_gemini_pro(text, min_length=150, max_length=300):
         response = requests.post(
             f"{api_url}?key={GEMINI_API_KEY}",
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=20,
         )
         
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "json" not in content_type:
+            logger.error(
+                "Gemini API returned non-JSON content (status %s)",
+                response.status_code,
+            )
+            return None
+
         # Check if the request was successful
         if response.status_code == 200:
             response_data = response.json()
@@ -406,7 +442,7 @@ def summarize_with_gpt(text, max_tokens=800):
             client = _OpenAI(api_key=api_key)
             logger.info("Using OpenAI v1.x client")
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=max_tokens
@@ -422,7 +458,7 @@ def summarize_with_gpt(text, max_tokens=800):
         logger.info("Using OpenAI v0.x API (legacy)")
         _openai.api_key = api_key
         response = _openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=messages,
             temperature=0.7,
             max_tokens=max_tokens
@@ -576,17 +612,20 @@ def integrated_summarize(url, text_content, post_process_function=None, extract_
                     except Exception as gemini_pro_error:
                         logger.error(f"Gemini Pro summarization failed: {gemini_pro_error}")
             
-            # Try GPT-2 (offline model)
-            try:
-                logger.info("Attempting summarization with GPT-2")
-                summary = summarize_with_gpt2(text_content)
-                if summary and len(summary) > 100:
-                    logger.info("GPT-2 summarization successful")
-                    if post_process_function:
-                        summary = post_process_function(summary)
-                    return summary
-            except Exception as e:
-                logger.error(f"GPT-2 summarization failed: {e}")
+            # GPT-2 is a generator, not a summarizer, and it downloads hundreds of MB
+            # on first use. Doing that inside /process blows past host timeouts, and
+            # the platform then answers with an HTML error page instead of JSON.
+            if os.environ.get("ENABLE_GPT2") == "1":
+                try:
+                    logger.info("Attempting summarization with GPT-2")
+                    summary = summarize_with_gpt2(text_content)
+                    if summary and len(summary) > 100:
+                        logger.info("GPT-2 summarization successful")
+                        if post_process_function:
+                            summary = post_process_function(summary)
+                        return summary
+                except Exception as e:
+                    logger.error(f"GPT-2 summarization failed: {e}")
             
             # Try OpenAI if API key is available
             if API_KEY:
