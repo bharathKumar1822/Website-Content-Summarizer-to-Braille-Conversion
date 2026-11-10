@@ -1,4 +1,4 @@
-"""
+﻿"""
 Enhanced summarization module using LLM-based approaches with newspaper3k content extraction.
 This module provides improved summarization capabilities for the URL to Braille Converter.
 """
@@ -11,7 +11,7 @@ from newspaper import Article
 import openai
 import pickle
 import sys
-import sentencepiece as spm
+# sentencepiece import removed - was imported but never used (no spm. calls)
 from functools import lru_cache
 import logging
 from pathlib import Path
